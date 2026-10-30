@@ -223,3 +223,10 @@ __marimo__/
 *.db
 create_admin.py
 reset_admin_password.py
+
+# Node / React stuff
+node_modules/
+dist/
+build/
+.vite/
+.DS_Store
