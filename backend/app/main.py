@@ -1,16 +1,14 @@
-from fastapi import FastAPI
+﻿from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.database import engine, Base
-
-# Import all routers
 from app.routers import auth, catalog, subscriptions, billing, payments, dashboard
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+app = FastAPI(
+    title="Brightloop Subscription Management Platform",
+    description="Backend API for managing SaaS product catalog, recurring billing plans, quotes, subscriptions, and lifecycle automation.",
+    version="1.0.0",
+)
 
-app = FastAPI(title="Brightloop Subscription Management API", version="1.0.0")
-
-# Enable CORS for frontend
+# Enable CORS for Swagger UI and Frontend clients
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routes
+# Register Subsystems
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(catalog.router, prefix="/api/catalog", tags=["Catalog & Plans"])
 app.include_router(subscriptions.router, prefix="/api/subscriptions", tags=["Subscriptions"])
@@ -27,6 +25,6 @@ app.include_router(billing.router, prefix="/api/billing", tags=["Billing & Invoi
 app.include_router(payments.router, prefix="/api/payments", tags=["Payments"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
 
-@app.get("/")
+@app.get("/", tags=["Health"])
 def health_check():
-    return {"status": "running", "service": "Brightloop Subscription Engine"}
+    return {"status": "online", "platform": "Brightloop"}
