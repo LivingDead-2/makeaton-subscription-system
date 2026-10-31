@@ -1,211 +1,377 @@
-﻿import uuid
 from datetime import date, timedelta
-from typing import List, Optional
+from calendar import monthrange
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.models import (
+    Subscription,
+    SubscriptionLine,
     Invoice,
     InvoiceLine,
-    InvoiceStatus,
-    Subscription,
+    Discount,
+    DiscountType,
     SubStatus,
-    User,
-    UserRole
+    InvoiceStatus,
 )
-from app.routers.auth import get_current_user, require_staff_or_admin
+from app.schemas import InvoiceResponse
+from app.routers.auth import require_admin, require_staff_or_admin
 
 router = APIRouter()
 
-# --- Pydantic Schemas ---
-class InvoiceLineResponse(BaseModel):
-    id: int
-    product_id: Optional[int] = None
-    description: Optional[str] = None
-    quantity: int
-    unit_price: float
-    tax_amount: float
-    line_total: float
 
-    class Config:
-        from_attributes = True
+def add_billing_cycle(current_date, cycle):
+    """Calculate the next billing date."""
+    if cycle.value == "DAILY":
+        return current_date + timedelta(days=1)
 
-class InvoiceResponse(BaseModel):
-    id: int
-    invoice_number: str
-    subscription_id: Optional[int] = None
-    customer_id: int
-    issue_date: Optional[date] = None
-    due_date: Optional[date] = None
-    subtotal: Optional[float] = 0.0
-    tax_total: Optional[float] = 0.0
-    discount_total: Optional[float] = 0.0
-    grand_total: Optional[float] = 0.0
-    paid_amount: Optional[float] = 0.0
-    status: InvoiceStatus
-    lines: List[InvoiceLineResponse] = []
+    if cycle.value == "WEEKLY":
+        return current_date + timedelta(weeks=1)
 
-    class Config:
-        from_attributes = True
+    if cycle.value == "MONTHLY":
+        next_month = current_date.month + 1
+        next_year = current_date.year
 
-class GenerateInvoiceRequest(BaseModel):
-    subscription_id: int
+        if next_month > 12:
+            next_month = 1
+            next_year += 1
 
-# --- API Endpoints ---
-
-@router.post("/generate", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
-def generate_invoice_from_subscription(
-    payload: GenerateInvoiceRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_staff_or_admin)
-):
-    sub = db.query(Subscription).filter(Subscription.id == payload.subscription_id).first()
-    if not sub:
-        raise HTTPException(status_code=404, detail="Subscription not found")
-
-    if sub.status not in [SubStatus.ACTIVE, SubStatus.CONFIRMED]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot generate invoice for subscription in '{sub.status.value}' state. Must be ACTIVE or CONFIRMED."
+        day = min(
+            current_date.day,
+            monthrange(next_year, next_month)[1]
         )
 
-    calculated_subtotal = 0.0
-    calculated_tax_total = 0.0
-    calculated_grand_total = 0.0
-    line_snapshots = []
+        return date(next_year, next_month, day)
 
-    for line in sub.lines:
-        line_base = line.quantity * line.unit_price
-        line_tax = line_base * ((line.tax_percent or 0.0) / 100.0)
-        line_total = line_base + line_tax
+    if cycle.value == "YEARLY":
+        try:
+            return current_date.replace(year=current_date.year + 1)
+        except ValueError:
+            return current_date.replace(
+                year=current_date.year + 1,
+                day=28
+            )
 
-        calculated_subtotal += line_base
-        calculated_tax_total += line_tax
-        calculated_grand_total += line_total
+    raise ValueError("Unsupported billing cycle")
 
-        line_snapshots.append({
-            "product_id": line.product_id,
-            "description": f"Subscription charge (Product #{line.product_id})",
-            "quantity": line.quantity,
-            "unit_price": line.unit_price,
-            "tax_amount": round(line_tax, 2),
-            "line_total": round(line_total, 2)
-        })
+
+
+def calculate_discount(db, subscription, subtotal, quantity):
+    """Calculate discount only on eligible subscription products."""
+
+    if not subscription.applied_discount_id:
+        return 0.0, None
+
+    discount = db.query(Discount).filter(
+        Discount.id == subscription.applied_discount_id
+    ).first()
+
+    if not discount:
+        return 0.0, None
 
     today = date.today()
-    due = today + timedelta(days=sub.payment_terms_days or 15)
-    inv_number = f"INV-{uuid.uuid4().hex[:8].upper()}"
 
-    new_invoice = Invoice(
-        invoice_number=inv_number,
-        subscription_id=sub.id,
-        customer_id=sub.customer_id,
-        issue_date=today,
-        due_date=due,
-        subtotal=round(calculated_subtotal, 2),
-        tax_total=round(calculated_tax_total, 2),
-        discount_total=0.0,
-        grand_total=round(calculated_grand_total, 2),
-        paid_amount=0.0,
-        status=InvoiceStatus.DRAFT
+    # Check discount validity dates.
+    if discount.valid_from and today < discount.valid_from:
+        return 0.0, None
+
+    if discount.valid_to and today > discount.valid_to:
+        return 0.0, None
+
+    # Check usage limit.
+    if (
+        discount.usage_limit is not None
+        and discount.times_used >= discount.usage_limit
+    ):
+        return 0.0, None
+
+    # Identify eligible subscription lines.
+    eligible_lines = [
+        line for line in subscription.lines
+        if discount.product_id is None
+        or line.product_id == discount.product_id
+    ]
+
+    if not eligible_lines:
+        return 0.0, None
+
+    eligible_amount = sum(
+        line.unit_price * line.quantity
+        for line in eligible_lines
     )
-    db.add(new_invoice)
-    db.flush()
 
-    for item in line_snapshots:
-        inv_line = InvoiceLine(
-            invoice_id=new_invoice.id,
-            product_id=item["product_id"],
-            description=item["description"],
-            quantity=item["quantity"],
-            unit_price=item["unit_price"],
-            tax_amount=item["tax_amount"],
-            line_total=item["line_total"]
-        )
-        db.add(inv_line)
+    eligible_quantity = sum(
+        line.quantity for line in eligible_lines
+    )
 
-    db.commit()
-    db.refresh(new_invoice)
-    return new_invoice
+    # Check minimum purchase requirements.
+    if eligible_amount < discount.min_amount:
+        return 0.0, None
 
-@router.get("/", response_model=List[InvoiceResponse])
-def list_invoices(
-    customer_id: Optional[int] = None,
-    status_filter: Optional[InvoiceStatus] = None,
+    if eligible_quantity < discount.min_quantity:
+        return 0.0, None
+
+    # Calculate discount.
+    if discount.discount_type == DiscountType.PERCENTAGE:
+        amount = eligible_amount * discount.value / 100
+    else:
+        amount = discount.value
+
+    return round(min(amount, eligible_amount), 2), discount
+
+
+
+# --------------------------------------------------
+# 1. AUTOMATIC INVOICE GENERATION
+# --------------------------------------------------
+
+@router.post("/generate", response_model=list[InvoiceResponse])
+def generate_invoices(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    admin=Depends(require_admin)
 ):
-    query = db.query(Invoice)
+    today = date.today()
 
-    role_val = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
-    if role_val == "CUSTOMER":
-        query = query.filter(Invoice.customer_id == current_user.id)
-    elif customer_id:
-        query = query.filter(Invoice.customer_id == customer_id)
+    subscriptions = db.query(Subscription).options(
+        joinedload(Subscription.lines),
+        joinedload(Subscription.plan)
+    ).filter(
+        Subscription.status == SubStatus.ACTIVE,
+        Subscription.next_billing_date <= today
+    ).all()
 
-    if status_filter:
-        query = query.filter(Invoice.status == status_filter)
+    generated_invoices = []
 
-    return query.order_by(Invoice.id.desc()).all()
+    try:
+        for subscription in subscriptions:
 
-@router.get("/{invoice_id}", response_model=InvoiceResponse)
+            # Skip subscriptions with no billing lines.
+            if not subscription.lines:
+                continue
+
+            # Prevent duplicate invoice generation.
+            existing_invoice = db.query(Invoice).filter(
+                Invoice.subscription_id == subscription.id,
+                Invoice.issue_date == today
+            ).first()
+
+            if existing_invoice:
+                continue
+
+            subtotal = 0.0
+            tax_total = 0.0
+            total_quantity = 0
+            invoice_lines = []
+
+            for line in subscription.lines:
+                line_subtotal = round(
+                    line.unit_price * line.quantity, 2
+                )
+
+                line_tax = round(
+                    line_subtotal * line.tax_percent / 100, 2
+                )
+
+                subtotal += line_subtotal
+                tax_total += line_tax
+                total_quantity += line.quantity
+
+                invoice_lines.append(
+                    InvoiceLine(
+                        product_id=line.product_id,
+                        description=(
+                            line.product.name
+                            if line.product else "Subscription Product"
+                        ),
+                        quantity=line.quantity,
+                        unit_price=line.unit_price,
+                        tax_amount=line_tax,
+                        line_total=round(
+                            line_subtotal + line_tax, 2
+                        )
+                    )
+                )
+
+            subtotal = round(subtotal, 2)
+            tax_total = round(tax_total, 2)
+
+            discount_amount, discount = calculate_discount(
+                db,
+                subscription,
+                subtotal,
+                total_quantity
+            )
+
+            grand_total = round(
+                subtotal + tax_total - discount_amount, 2
+            )
+
+            invoice = Invoice(
+                invoice_number=f"INV-{uuid4().hex[:10].upper()}",
+                subscription_id=subscription.id,
+                customer_id=subscription.customer_id,
+                status=InvoiceStatus.DRAFT,
+                issue_date=today,
+                due_date=today + timedelta(
+                    days=subscription.payment_terms_days
+                ),
+                subtotal=subtotal,
+                tax_total=tax_total,
+                discount_total=round(discount_amount, 2),
+                grand_total=grand_total,
+                paid_amount=0.0,
+                lines=invoice_lines
+            )
+
+            db.add(invoice)
+
+            # Increment discount usage only when applied.
+            if discount and discount_amount > 0:
+                discount.times_used += 1
+
+            # Update subscription billing dates.
+            # Update subscription billing dates.
+            previous_due_date = subscription.next_billing_date
+
+            subscription.last_billed_date = today
+            subscription.next_billing_date = add_billing_cycle(
+                previous_due_date,
+                subscription.plan.billing_cycle
+            )
+
+            # Automatically close expired subscriptions if configured.
+            if (
+                subscription.expiry_date
+                and today >= subscription.expiry_date
+                and subscription.plan.auto_close_on_expiry
+            ):
+                subscription.status = SubStatus.CLOSED
+
+            generated_invoices.append(invoice)
+
+        db.commit()
+
+        for invoice in generated_invoices:
+            db.refresh(invoice)
+
+        return generated_invoices
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Invoice generation failed."
+        )
+
+
+# --------------------------------------------------
+# 2. LIST ALL INVOICES
+# --------------------------------------------------
+
+@router.get("/invoices", response_model=list[InvoiceResponse])
+def list_invoices(
+    db: Session = Depends(get_db),
+    user=Depends(require_staff_or_admin)
+):
+    return db.query(Invoice).options(
+        joinedload(Invoice.lines)
+    ).order_by(
+        Invoice.issue_date.desc()
+    ).all()
+
+
+# --------------------------------------------------
+# 3. GET INVOICE DETAILS
+# --------------------------------------------------
+
+@router.get("/invoices/{invoice_id}", response_model=InvoiceResponse)
 def get_invoice(
     invoice_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    user=Depends(require_staff_or_admin)
 ):
-    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+    invoice = db.query(Invoice).options(
+        joinedload(Invoice.lines)
+    ).filter(
+        Invoice.id == invoice_id
+    ).first()
 
-    role_val = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
-    if role_val == "CUSTOMER" and invoice.customer_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized to access this invoice")
+    if not invoice:
+        raise HTTPException(
+            status_code=404,
+            detail="Invoice not found."
+        )
 
     return invoice
 
-@router.patch("/{invoice_id}/confirm", response_model=InvoiceResponse)
+
+# --------------------------------------------------
+# 4. CONFIRM INVOICE
+# --------------------------------------------------
+
+@router.post("/invoices/{invoice_id}/confirm")
 def confirm_invoice(
     invoice_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_staff_or_admin)
+    user=Depends(require_staff_or_admin)
 ):
-    """
-    Confirm and issue a draft invoice for payment.
-    """
-    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+    invoice = db.query(Invoice).filter(
+        Invoice.id == invoice_id
+    ).first()
 
-    status_val = invoice.status.value if hasattr(invoice.status, "value") else str(invoice.status)
-    if status_val != "DRAFT":
+    if not invoice:
+        raise HTTPException(
+            status_code=404,
+            detail="Invoice not found."
+        )
+
+    if invoice.status != InvoiceStatus.DRAFT:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot confirm invoice in '{status_val}' state. Must be DRAFT."
+            detail="Only draft invoices can be confirmed."
         )
 
     invoice.status = InvoiceStatus.CONFIRMED
     db.commit()
-    db.refresh(invoice)
-    return invoice
 
-@router.patch("/{invoice_id}/cancel", response_model=InvoiceResponse)
+    return {
+        "message": "Invoice confirmed successfully.",
+        "invoice_id": invoice.id
+    }
+
+
+# --------------------------------------------------
+# 5. CANCEL INVOICE
+# --------------------------------------------------
+
+@router.post("/invoices/{invoice_id}/cancel")
 def cancel_invoice(
     invoice_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_staff_or_admin)
+    user=Depends(require_admin)
 ):
-    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+    invoice = db.query(Invoice).filter(
+        Invoice.id == invoice_id
+    ).first()
 
-    status_val = invoice.status.value if hasattr(invoice.status, "value") else str(invoice.status)
-    if status_val == "PAID":
-        raise HTTPException(status_code=400, detail="Cannot cancel an invoice that has already been paid.")
+    if not invoice:
+        raise HTTPException(
+            status_code=404,
+            detail="Invoice not found."
+        )
+
+    if invoice.status != InvoiceStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail="Only draft invoices can be cancelled."
+        )
 
     invoice.status = InvoiceStatus.CANCELLED
     db.commit()
-    db.refresh(invoice)
-    return invoice
+
+    return {
+        "message": "Invoice cancelled successfully.",
+        "invoice_id": invoice.id
+    }

@@ -1,6 +1,15 @@
 ﻿from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import auth, catalog, subscriptions, billing, payments, dashboard
+
+from app.routers import (
+    auth,
+    catalog,
+    subscriptions,
+    billing,
+    payments,
+    dashboard,
+    discounts,
+)
 
 app = FastAPI(
     title="Brightloop Subscription Management Platform",
@@ -17,13 +26,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register Subsystems
+# Register all routers
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(catalog.router, prefix="/api/catalog", tags=["Catalog & Plans"])
 app.include_router(subscriptions.router, prefix="/api/subscriptions", tags=["Subscriptions"])
 app.include_router(billing.router, prefix="/api/billing", tags=["Billing & Invoices"])
 app.include_router(payments.router, prefix="/api/payments", tags=["Payments"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
+app.include_router(discounts.router, prefix="/api/discounts", tags=["Discounts"])
+
 
 @app.get("/", tags=["Health"])
 def health_check():

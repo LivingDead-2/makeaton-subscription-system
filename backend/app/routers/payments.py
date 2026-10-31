@@ -1,105 +1,142 @@
-﻿from datetime import datetime
-from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
 
 from app.database import get_db
-from app.models import (
-    Invoice,
-    InvoiceStatus,
-    Payment,
-    User,
-    UserRole
-)
-from app.routers.auth import get_current_user, require_staff_or_admin
+from app.models import Payment, Invoice, InvoiceStatus
+from app.schemas import PaymentCreate, PaymentResponse
+from app.routers.auth import require_staff_or_admin
 
 router = APIRouter()
 
-# --- Pydantic Schemas ---
-class PaymentCreate(BaseModel):
-    invoice_id: int
-    amount: float
-    payment_method: str = "Credit Card"
-    reference_note: Optional[str] = None
 
-class PaymentResponse(BaseModel):
-    id: int
-    invoice_id: int
-    payment_method: str
-    amount: float
-    payment_date: datetime
-    reference_note: Optional[str] = None
+# --------------------------------------------------
+# 1. RECORD A PAYMENT
+# --------------------------------------------------
 
-    class Config:
-        from_attributes = True
-
-# --- API Endpoints ---
-
-@router.post("/", response_model=PaymentResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=PaymentResponse,
+    status_code=status.HTTP_201_CREATED
+)
 def record_payment(
     payload: PaymentCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    user=Depends(require_staff_or_admin)
 ):
-    """
-    Record a payment against a CONFIRMED invoice.
-    Updates the invoice's paid_amount and sets status to PAID once settled.
-    """
-    invoice = db.query(Invoice).filter(Invoice.id == payload.invoice_id).first()
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+    invoice = db.query(Invoice).filter(
+        Invoice.id == payload.invoice_id
+    ).first()
 
-    status_val = invoice.status.value if hasattr(invoice.status, "value") else str(invoice.status)
-    if status_val not in ["CONFIRMED", "DRAFT"]:
+    if not invoice:
         raise HTTPException(
-            status_code=400,
-            detail=f"Cannot record payment for an invoice in '{status_val}' state."
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invoice not found."
+        )
+
+    if invoice.status == InvoiceStatus.CANCELLED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot record payment for a cancelled invoice."
+        )
+
+    if invoice.status == InvoiceStatus.PAID:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This invoice is already fully paid."
+        )
+
+    if invoice.status != InvoiceStatus.CONFIRMED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only confirmed invoices can receive payments."
         )
 
     if payload.amount <= 0:
-        raise HTTPException(status_code=400, detail="Payment amount must be greater than zero.")
-
-    # Calculate remaining balance
-    current_paid = invoice.paid_amount or 0.0
-    remaining = round(invoice.grand_total - current_paid, 2)
-    if payload.amount > remaining:
         raise HTTPException(
-            status_code=400,
-            detail=f"Payment exceeds balance due. Remaining balance: {remaining}"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Payment amount must be greater than zero."
         )
 
-    # Persist payment record
+    remaining_amount = round(
+        invoice.grand_total - invoice.paid_amount, 2
+    )
+
+    if payload.amount > remaining_amount:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Payment exceeds the outstanding balance of {remaining_amount}."
+        )
+
     payment = Payment(
         invoice_id=invoice.id,
-        payment_method=payload.payment_method,
-        amount=payload.amount,
-        payment_date=datetime.utcnow(),
+        payment_method=payload.payment_method.strip(),
+        amount=round(payload.amount, 2),
         reference_note=payload.reference_note
     )
-    db.add(payment)
 
-    # Update invoice paid balance & status
-    invoice.paid_amount = round(current_paid + payload.amount, 2)
-    if invoice.paid_amount >= invoice.grand_total:
-        invoice.status = InvoiceStatus.PAID
+    try:
+        db.add(payment)
 
-    db.commit()
-    db.refresh(payment)
-    return payment
+        invoice.paid_amount = round(
+            invoice.paid_amount + payload.amount, 2
+        )
 
-@router.get("/invoice/{invoice_id}", response_model=List[PaymentResponse])
-def get_payments_for_invoice(
+        # Mark invoice as PAID only after full payment.
+        if invoice.paid_amount >= invoice.grand_total:
+            invoice.status = InvoiceStatus.PAID
+
+        db.commit()
+        db.refresh(payment)
+
+        return payment
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to record payment."
+        )
+
+
+# --------------------------------------------------
+# 2. GET ALL PAYMENTS
+# --------------------------------------------------
+
+@router.get("/", response_model=list[PaymentResponse])
+def list_payments(
+    db: Session = Depends(get_db),
+    user=Depends(require_staff_or_admin)
+):
+    return db.query(Payment).order_by(
+        Payment.payment_date.desc()
+    ).all()
+
+
+# --------------------------------------------------
+# 3. GET PAYMENTS FOR A PARTICULAR INVOICE
+# --------------------------------------------------
+
+@router.get(
+    "/invoice/{invoice_id}",
+    response_model=list[PaymentResponse]
+)
+def get_invoice_payments(
     invoice_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    user=Depends(require_staff_or_admin)
 ):
-    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+    invoice = db.query(Invoice).filter(
+        Invoice.id == invoice_id
+    ).first()
+
     if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invoice not found."
+        )
 
-    role_val = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
-    if role_val == "CUSTOMER" and invoice.customer_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized to access these payment records")
-
-    return db.query(Payment).filter(Payment.invoice_id == invoice_id).all()
+    return db.query(Payment).filter(
+        Payment.invoice_id == invoice_id
+    ).order_by(
+        Payment.payment_date.desc()
+    ).all()
