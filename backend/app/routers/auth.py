@@ -1,16 +1,18 @@
 ﻿import re
-import datetime
+import os
+import hashlib
+import hmac
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from passlib.context import CryptContext
 import jwt
 from pydantic import BaseModel, EmailStr
 
 from app.database import get_db
 from app.models import User, UserRole
-from app.schemas import UserResponse, TokenResponse
+from app.schemas import UserResponse
 
 router = APIRouter()
 
@@ -18,7 +20,6 @@ SECRET_KEY = "brightloop-hackathon-supersecret-jwt-key"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 class UserSignupRequest(BaseModel):
@@ -31,11 +32,25 @@ class StaffCreateRequest(BaseModel):
     email: EmailStr
     password: str
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+class TokenSchema(BaseModel):
+    access_token: str
+    token_type: str
 
+# Standard PBKDF2 Password Hashing (Zero bcrypt/passlib issues)
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100000)
+    return f"{salt.hex()}:{key.hex()}"
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        salt_hex, key_hex = hashed_password.split(":")
+        salt = bytes.fromhex(salt_hex)
+        expected_key = bytes.fromhex(key_hex)
+        key = hashlib.pbkdf2_hmac("sha256", plain_password.encode("utf-8"), salt, 100000)
+        return hmac.compare_digest(key, expected_key)
+    except Exception:
+        return False
 
 def validate_password_complexity(password: str):
     if len(password) <= 8:
@@ -59,9 +74,9 @@ def validate_password_complexity(password: str):
             detail="Password must contain at least one special character (!@#$%^&*...)."
         )
 
-def create_access_token(data: dict, expires_delta: Optional[datetime.timedelta] = None):
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    expire = datetime.datetime.utcnow() + (expires_delta or datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -85,12 +100,14 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    if current_user.role != UserRole.ADMIN:
+    role_str = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    if role_str != "ADMIN":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required.")
     return current_user
 
 def require_staff_or_admin(current_user: User = Depends(get_current_user)) -> User:
-    if current_user.role not in [UserRole.ADMIN, UserRole.STAFF]:
+    role_str = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    if role_str not in ["ADMIN", "STAFF"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Staff or Admin role required.")
     return current_user
 
@@ -110,20 +127,17 @@ def customer_signup(payload: UserSignupRequest, db: Session = Depends(get_db)):
     db.refresh(user)
     return user
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenSchema)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password.")
     
-    token = create_access_token(data={"sub": user.email, "role": user.role.value, "id": user.id})
+    role_str = user.role.value if hasattr(user.role, "value") else str(user.role)
+    token = create_access_token(data={"sub": user.email, "role": role_str, "id": user.id})
     return {
         "access_token": token,
-        "token_type": "bearer",
-        "role": user.role.value,
-        "user_id": user.id,
-        "name": user.name,
-        "email": user.email
+        "token_type": "bearer"
     }
 
 @router.post("/staff", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
