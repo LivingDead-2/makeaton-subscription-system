@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Node / React stuff
+node_modules/
+dist/
+build/
+.vite/
+.DS_Store
