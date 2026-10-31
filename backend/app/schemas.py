@@ -1,4 +1,4 @@
-﻿from pydantic import BaseModel, EmailStr, Field
+﻿from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import List, Optional
 from datetime import date, datetime
 from enum import Enum
@@ -200,9 +200,17 @@ class InvoiceResponse(InvoiceBase):
 # --- Payment Schemas ---
 class PaymentCreate(BaseModel):
     invoice_id: int
-    payment_method: str  # Card, Bank Transfer, UPI, Cash
-    amount: float
+    payment_method: str = Field(..., min_length=1)
+    amount: float = Field(..., gt=0)
     reference_note: Optional[str] = None
+
+    @field_validator("payment_method")
+    @classmethod
+    def validate_payment_method(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Payment method cannot be empty.")
+        return value
 
 class PaymentResponse(BaseModel):
     id: int
@@ -211,6 +219,35 @@ class PaymentResponse(BaseModel):
     amount: float
     payment_date: datetime
     reference_note: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+# --- Discount Schemas ---
+class DiscountCreate(BaseModel):
+    code: str
+    discount_type: DiscountType
+    value: float = Field(..., gt=0)
+    min_amount: float = Field(default=0.0, ge=0)
+    min_quantity: int = Field(default=0, ge=0)
+    usage_limit: Optional[int] = Field(default=None, gt=0)
+    valid_from: Optional[date] = None
+    valid_to: Optional[date] = None
+    product_id: Optional[int] = None
+
+
+class DiscountResponse(BaseModel):
+    id: int
+    code: str
+    discount_type: DiscountType
+    value: float
+    min_amount: float
+    min_quantity: int
+    usage_limit: Optional[int]
+    times_used: int
+    valid_from: Optional[date]
+    valid_to: Optional[date]
+    product_id: Optional[int]
 
     class Config:
         from_attributes = True

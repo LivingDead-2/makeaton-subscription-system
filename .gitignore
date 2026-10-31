@@ -219,6 +219,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Local database and temporary admin scripts
+*.db
+create_admin.py
+reset_admin_password.py
+
 # Node / React stuff
 node_modules/
 dist/
